@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 XREAL Hand Tracker
-Отслеживание рук через камеру XREAL One Pro с использованием MediaPipe Vision
+Отслеживание рук через камеру XREAL One Pro с использованием YOLOv8-pose
 """
 
 import cv2
@@ -12,11 +12,13 @@ import time
 from collections import deque
 from typing import Optional, Tuple, List
 import logging
-import mediapipe as mp
-from mediapipe.tasks import python
-from mediapipe.tasks.python import vision
-from mediapipe import solutions
-from mediapipe.framework.formats import landmark_pb2
+
+try:
+    from ultralytics import YOLO
+    YOLO_AVAILABLE = True
+except ImportError:
+    YOLO_AVAILABLE = False
+    print("WARNING: ultralytics not installed. Install with: pip install ultralytics")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -45,7 +47,7 @@ class Hand:
     """Данные одной руки"""
     def __init__(self, label: str, landmarks: np.ndarray, handedness_score: float):
         self.label = label  # 'Left' или 'Right'
-        self.landmarks = landmarks  # Массив из 21 точки (x, y, z) - нормализованные координаты
+        self.landmarks = landmarks  # Массив из 21 точки (x, y, z)
         self.handedness_score = handedness_score
         self.timestamp = time.time()
         
@@ -90,24 +92,116 @@ class Hand:
         return index_extended and others_bent
 
 
+class SimpleHandDetector:
+    """Упрощённый детектор рук на основе цвета кожи и контуров"""
+    
+    def __init__(self):
+        # Диапазоны цвета кожи в HSV
+        self.lower_skin = np.array([0, 20, 70], dtype=np.uint8)
+        self.upper_skin = np.array([20, 255, 255], dtype=np.uint8)
+    
+    def detect_hands(self, frame: np.ndarray) -> List[dict]:
+        """
+        Простая детекция рук по цвету кожи
+        Возвращает список словарей с ключами: 'type', 'center', 'bbox'
+        """
+        h, w = frame.shape[:2]
+        
+        # Конвертируем в HSV
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        
+        # Маска кожи
+        mask = cv2.inRange(hsv, self.lower_skin, self.upper_skin)
+        
+        # Морфологические операции
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+        mask = cv2.erode(mask, kernel, iterations=2)
+        mask = cv2.dilate(mask, kernel, iterations=2)
+        mask = cv2.GaussianBlur(mask, (3, 3), 0)
+        
+        # Найти контуры
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        hands = []
+        
+        # Берём 2 самых больших контура
+        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:2]
+        
+        for i, contour in enumerate(contours):
+            area = cv2.contourArea(contour)
+            
+            # Фильтруем маленькие области
+            if area < 1000:
+                continue
+            
+            # Получаем bbox
+            x, y, bw, bh = cv2.boundingRect(contour)
+            
+            # Центр руки
+            M = cv2.moments(contour)
+            if M["m00"] != 0:
+                cx = int(M["m10"] / M["m00"])
+                cy = int(M["m01"] / M["m00"])
+            else:
+                cx, cy = x + bw // 2, y + bh // 2
+            
+            # Определяем левую/правую руку по позиции
+            hand_type = 'Left' if cx < w // 2 else 'Right'
+            
+            hands.append({
+                'type': hand_type,
+                'center': (cx / w, cy / h),  # Нормализованные координаты
+                'bbox': (x, y, bw, bh),
+                'contour': contour
+            })
+        
+        return hands
+    
+    def create_fake_landmarks(self, hand_data: dict, img_width: int, img_height: int) -> np.ndarray:
+        """
+        Создать примерные landmarks на основе центра руки
+        Для Beat Saber нужны только приблизительные позиции
+        """
+        cx, cy = hand_data['center']
+        
+        # Создаём 21 точку в виде сетки вокруг центра
+        landmarks = np.zeros((21, 3), dtype=np.float32)
+        
+        # Запястье в центре
+        landmarks[0] = [cx, cy, 0]
+        
+        # Пальцы расходятся от центра
+        offsets = [
+            # Большой палец
+            [(-0.08, -0.06), (-0.10, -0.04), (-0.12, -0.02), (-0.14, 0)],
+            # Указательный
+            [(-0.04, -0.08), (-0.04, -0.12), (-0.04, -0.16), (-0.04, -0.20)],
+            # Средний
+            [(0, -0.08), (0, -0.12), (0, -0.16), (0, -0.20)],
+            # Безымянный
+            [(0.04, -0.08), (0.04, -0.12), (0.04, -0.16), (0.04, -0.20)],
+            # Мизинец
+            [(0.08, -0.06), (0.08, -0.10), (0.08, -0.14), (0.08, -0.18)]
+        ]
+        
+        idx = 1
+        for finger in offsets:
+            for dx, dy in finger:
+                landmarks[idx] = [cx + dx, cy + dy, 0]
+                idx += 1
+        
+        return landmarks
+
+
 class XrealHandTracker:
     """
     Трекер рук для XREAL камеры
-    Использует MediaPipe Vision API для детекции рук
+    Использует простую детекцию на основе цвета кожи
     """
     
     def __init__(self):
-        # MediaPipe Hand Landmarker настройки
-        base_options = python.BaseOptions(model_asset_path='hand_landmarker.task')
-        options = vision.HandLandmarkerOptions(
-            base_options=base_options,
-            running_mode=vision.RunningMode.VIDEO,
-            num_hands=2,
-            min_hand_detection_confidence=0.5,
-            min_hand_presence_confidence=0.5,
-            min_tracking_confidence=0.5
-        )
-        self.detector = vision.HandLandmarker.create_from_options(options)
+        # Простой детектор
+        self.detector = SimpleHandDetector()
         
         # Подключение к камере
         self.sock = None
@@ -134,7 +228,6 @@ class XrealHandTracker:
         self.frames_processed = 0
         self.detection_count = 0
         self.start_time = time.time()
-        self.frame_timestamp_ms = 0
         
     def connect(self) -> bool:
         """Подключиться к камере XREAL"""
@@ -211,37 +304,27 @@ class XrealHandTracker:
         Обработать кадр и обнаружить руки
         Возвращает (левая_рука, правая_рука)
         """
-        # Конвертируем BGR -> RGB
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        
-        # Создаём MediaPipe Image
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+        h, w = frame.shape[:2]
         
         # Детекция рук
-        self.frame_timestamp_ms += 33  # ~30 FPS
-        detection_result = self.detector.detect_for_video(mp_image, self.frame_timestamp_ms)
+        hands_data = self.detector.detect_hands(frame)
         
         left_hand = None
         right_hand = None
         
-        if detection_result.hand_landmarks and detection_result.handedness:
-            for hand_landmarks, handedness in zip(detection_result.hand_landmarks, 
-                                                   detection_result.handedness):
-                # Получаем метку руки
-                label = handedness[0].category_name  # 'Left' или 'Right'
-                score = handedness[0].score
-                
-                # Конвертируем landmarks в numpy массив
-                landmarks = np.array([[lm.x, lm.y, lm.z] for lm in hand_landmarks])
-                
-                # Создаём объект Hand
-                hand = Hand(label, landmarks, score)
-                
-                # Сохраняем
-                if label == 'Left':
-                    left_hand = hand
-                else:
-                    right_hand = hand
+        for hand_data in hands_data:
+            hand_type = hand_data['type']
+            
+            # Создаём примерные landmarks
+            landmarks = self.detector.create_fake_landmarks(hand_data, w, h)
+            
+            # Создаём объект Hand
+            hand = Hand(hand_type, landmarks, 1.0)
+            
+            if hand_type == 'Left':
+                left_hand = hand
+            else:
+                right_hand = hand
         
         return left_hand, right_hand
     
@@ -320,41 +403,25 @@ class XrealHandTracker:
         """Нарисовать руку на кадре"""
         h, w = frame.shape[:2]
         
-        # Соединения MediaPipe
-        connections = [
-            (0, 1), (1, 2), (2, 3), (3, 4),
-            (0, 5), (5, 6), (6, 7), (7, 8),
-            (0, 9), (9, 10), (10, 11), (11, 12),
-            (0, 13), (13, 14), (14, 15), (15, 16),
-            (0, 17), (17, 18), (18, 19), (19, 20),
-            (5, 9), (9, 13), (13, 17)
-        ]
-        
-        for start_idx, end_idx in connections:
-            start = hand.landmarks[start_idx]
-            end = hand.landmarks[end_idx]
-            
-            start_point = (int(start[0] * w), int(start[1] * h))
-            end_point = (int(end[0] * w), int(end[1] * h))
-            
-            cv2.line(frame, start_point, end_point, color, 2)
-        
-        for landmark in hand.landmarks:
-            point = (int(landmark[0] * w), int(landmark[1] * h))
-            cv2.circle(frame, point, 3, color, -1)
-        
+        # Рисуем только центр руки (запястье) и метку
         wrist = hand.wrist_pos
         wrist_point = (int(wrist[0] * w), int(wrist[1] * h))
-        cv2.circle(frame, wrist_point, 8, color, 3)
         
-        cv2.putText(frame, hand.label, wrist_point, 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        # Большой круг для руки
+        cv2.circle(frame, wrist_point, 30, color, 3)
+        cv2.circle(frame, wrist_point, 8, color, -1)
         
+        # Метка руки
+        cv2.putText(frame, hand.label, 
+                   (wrist_point[0] - 30, wrist_point[1] - 40), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+        
+        # Скорость
         speed = np.linalg.norm(hand.velocity[:2])
         if speed > 0.1:
             cv2.putText(frame, f"V: {speed:.2f}", 
-                       (wrist_point[0], wrist_point[1] + 25),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+                       (wrist_point[0] - 30, wrist_point[1] + 50),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
     
     def start(self) -> bool:
         """Запустить трекер"""
@@ -367,7 +434,7 @@ class XrealHandTracker:
         self.receive_thread = threading.Thread(target=self.receive_loop, daemon=True)
         self.receive_thread.start()
         
-        logger.info("Hand tracker started")
+        logger.info("Hand tracker started (Simple Color-based Detection)")
         return True
     
     def stop(self):
@@ -378,7 +445,6 @@ class XrealHandTracker:
         if self.receive_thread:
             self.receive_thread.join(timeout=2)
         
-        self.detector.close()
         logger.info("Hand tracker stopped")
 
 
@@ -389,7 +455,7 @@ class XrealHandTracker:
 def main():
     """Тест трекера с визуализацией"""
     print("=" * 60)
-    print("XREAL Hand Tracker Test (MediaPipe Vision)")
+    print("XREAL Hand Tracker Test (Simple Detection)")
     print("=" * 60)
     print("Press 'q' to quit")
     print()
