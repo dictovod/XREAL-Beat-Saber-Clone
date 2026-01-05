@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
 XREAL Hand Tracker
-Отслеживание рук через камеру XREAL One Pro с использованием MediaPipe
+Отслеживание рук через камеру XREAL One Pro с использованием cvzone
 """
 
 import cv2
-import mediapipe as mp
 import numpy as np
 import socket
 import threading
@@ -13,6 +12,7 @@ import time
 from collections import deque
 from typing import Optional, Tuple, List
 import logging
+from cvzone.HandTrackingModule import HandDetector
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -28,7 +28,7 @@ IMAGE_SIZE = WIDTH * HEIGHT
 
 
 class HandLandmark:
-    """Ключевые точки руки"""
+    """Ключевые точки руки (индексы как в MediaPipe)"""
     WRIST = 0
     THUMB_TIP = 4
     INDEX_TIP = 8
@@ -39,9 +39,9 @@ class HandLandmark:
 
 class Hand:
     """Данные одной руки"""
-    def __init__(self, label: str, landmarks: list, handedness_score: float):
+    def __init__(self, label: str, landmarks: np.ndarray, handedness_score: float):
         self.label = label  # 'Left' или 'Right'
-        self.landmarks = landmarks  # Список из 21 точки (x, y, z)
+        self.landmarks = landmarks  # Массив из 21 точки (x, y, z) - нормализованные координаты
         self.handedness_score = handedness_score
         self.timestamp = time.time()
         
@@ -92,21 +92,17 @@ class Hand:
 class XrealHandTracker:
     """
     Трекер рук для XREAL камеры
-    Использует MediaPipe Hands для детекции рук
+    Использует cvzone HandDetector для детекции рук
     """
     
     def __init__(self):
-        # MediaPipe настройки
-        self.mp_hands = mp.solutions.hands
-        self.mp_drawing = mp.solutions.drawing_utils
-        self.mp_drawing_styles = mp.solutions.drawing_styles
-        
-        # Инициализация детектора рук
-        self.hands = self.mp_hands.Hands(
-            static_image_mode=False,
-            max_num_hands=2,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
+        # cvzone настройки
+        self.detector = HandDetector(
+            staticMode=False,
+            maxHands=2,
+            modelComplexity=1,
+            detectionCon=0.5,
+            minTrackCon=0.5
         )
         
         # Подключение к камере
@@ -133,6 +129,7 @@ class XrealHandTracker:
         self.frames_received = 0
         self.frames_processed = 0
         self.detection_count = 0
+        self.start_time = time.time()
         
     def connect(self) -> bool:
         """Подключиться к камере XREAL"""
@@ -212,38 +209,54 @@ class XrealHandTracker:
                     logger.error(f"Receive error: {e}")
                 break
     
+    def normalize_landmarks(self, lmList: List, img_width: int, img_height: int) -> np.ndarray:
+        """
+        Нормализовать landmarks из пиксельных координат в 0-1
+        lmList от cvzone: [[id, x, y, z], ...]
+        Возвращает: numpy array размером (21, 3) с нормализованными координатами
+        """
+        landmarks = np.zeros((21, 3), dtype=np.float32)
+        
+        for lm in lmList:
+            idx = lm[0]  # id точки
+            x = lm[1] / img_width  # нормализация X
+            y = lm[2] / img_height  # нормализация Y
+            z = lm[3] / img_width if len(lm) > 3 else 0  # нормализация Z (если есть)
+            
+            if 0 <= idx < 21:
+                landmarks[idx] = [x, y, z]
+        
+        return landmarks
+    
     def process_frame(self, frame: np.ndarray) -> Tuple[Optional[Hand], Optional[Hand]]:
         """
         Обработать кадр и обнаружить руки
         Возвращает (левая_рука, правая_рука)
         """
-        # Конвертируем BGR -> RGB для MediaPipe
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w = frame.shape[:2]
         
-        # Детекция рук
-        results = self.hands.process(frame_rgb)
+        # Детекция рук с помощью cvzone
+        hands, img_annotated = self.detector.findHands(frame, draw=False)
         
         left_hand = None
         right_hand = None
         
-        if results.multi_hand_landmarks and results.multi_handedness:
-            for hand_landmarks, handedness in zip(results.multi_hand_landmarks, 
-                                                   results.multi_handedness):
-                # Получаем метку руки
-                label = handedness.classification[0].label  # 'Left' или 'Right'
-                score = handedness.classification[0].score
+        if hands:
+            for hand_data in hands:
+                # Получаем данные руки
+                lmList = hand_data["lmList"]  # Список из 21 точки [[id, x, y, z], ...]
+                hand_type = hand_data["type"]  # "Left" или "Right"
                 
-                # Конвертируем landmarks в numpy массив
-                landmarks = []
-                for landmark in hand_landmarks.landmark:
-                    landmarks.append([landmark.x, landmark.y, landmark.z])
-                landmarks = np.array(landmarks)
+                # cvzone возвращает координаты в пикселях, нормализуем их
+                landmarks = self.normalize_landmarks(lmList, w, h)
                 
                 # Создаём объект Hand
-                hand = Hand(label, landmarks, score)
+                # Используем confidence из bbox или устанавливаем 1.0
+                confidence = 1.0
+                hand = Hand(hand_type, landmarks, confidence)
                 
                 # Сохраняем
-                if label == 'Left':
+                if hand_type == 'Left':
                     left_hand = hand
                 else:
                     right_hand = hand
@@ -321,7 +334,8 @@ class XrealHandTracker:
             self._draw_hand_on_frame(frame, right, (255, 0, 0))  # Синий для правой
         
         # Добавляем информацию
-        cv2.putText(frame, f"FPS: {self.frames_received / max(1, time.time() - self.start_time):.0f}", 
+        elapsed = max(1, time.time() - self.start_time)
+        cv2.putText(frame, f"FPS: {self.frames_received / elapsed:.0f}", 
                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         cv2.putText(frame, f"Detected: {self.detection_count}", 
                    (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
@@ -332,10 +346,18 @@ class XrealHandTracker:
         """Нарисовать руку на кадре"""
         h, w = frame.shape[:2]
         
+        # Определяем соединения (как в MediaPipe)
+        connections = [
+            (0, 1), (1, 2), (2, 3), (3, 4),  # Большой палец
+            (0, 5), (5, 6), (6, 7), (7, 8),  # Указательный
+            (0, 9), (9, 10), (10, 11), (11, 12),  # Средний
+            (0, 13), (13, 14), (14, 15), (15, 16),  # Безымянный
+            (0, 17), (17, 18), (18, 19), (19, 20),  # Мизинец
+            (5, 9), (9, 13), (13, 17)  # Ладонь
+        ]
+        
         # Рисуем соединения
-        connections = self.mp_hands.HAND_CONNECTIONS
-        for connection in connections:
-            start_idx, end_idx = connection
+        for start_idx, end_idx in connections:
             start = hand.landmarks[start_idx]
             end = hand.landmarks[end_idx]
             
@@ -388,9 +410,6 @@ class XrealHandTracker:
         if self.receive_thread:
             self.receive_thread.join(timeout=2)
         
-        # Закрываем MediaPipe
-        self.hands.close()
-        
         logger.info("Hand tracker stopped")
 
 
@@ -401,7 +420,7 @@ class XrealHandTracker:
 def main():
     """Тест трекера с визуализацией"""
     print("=" * 60)
-    print("XREAL Hand Tracker Test")
+    print("XREAL Hand Tracker Test (cvzone)")
     print("=" * 60)
     print("Press 'q' to quit")
     print()
